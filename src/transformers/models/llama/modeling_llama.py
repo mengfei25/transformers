@@ -24,6 +24,8 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+# import torchao
+import intel_extension_for_pytorch as ipex
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
@@ -254,6 +256,91 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+import functools
+from typing import List, Optional
+import torch.library
+
+# @functools.lru_cache(None)
+# def get_meta_lib():
+#     return torch.library.Library("torchao", "IMPL", "Meta")
+
+
+# def register_meta(op_name, overload_name="default"):
+#     def wrapper(fn):
+#         get_meta_lib().impl(
+#             getattr(getattr(torch.ops.torchao, op_name), overload_name), fn
+#         )
+#         return fn
+
+#     return wrapper
+
+# @register_meta("paged_attention")
+# def meta_paged_attention(
+#     output,
+#     query,
+#     key_cache,
+#     value_cache,
+#     scale,
+#     block_tables,
+#     context_lens,
+#     attn_mask,
+# ):
+#     return None
+
+@functools.lru_cache(None)
+def get_meta_lib():
+    return torch.library.Library("myops", "IMPL", "Meta")
+
+
+def register_meta(op_name, overload_name="default"):
+    def wrapper(fn):
+        get_meta_lib().impl(
+            getattr(getattr(torch.ops.myops, op_name), overload_name), fn
+        )
+        return fn
+
+    return wrapper
+
+
+@torch.library.impl("myops::single_query_cached_kv_attention", "CPU")
+def single_query_cached_kv_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_mapping: torch.Tensor,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    max_context_len: int,
+    alibi_slopes: torch.Tensor,
+):
+    torch.ops.torch_ipex.single_query_cached_kv_attention(output, query, key_cache, value_cache, head_mapping, scale, block_tables, context_lens, block_size, max_context_len, alibi_slopes)
+    return output
+ 
+torch.library.define(
+    "myops::single_query_cached_kv_attention",
+    "(Tensor output, Tensor query, Tensor key_cache, Tensor value_cache, Tensor head_mapping, float scale,Tensor block_tables,Tensor context_lens,int block_size, int max_context_len, Tensor alibi_slopes)"
+    + " -> (Tensor)",
+)
+
+@register_meta("single_query_cached_kv_attention")
+def meta_single_query_cached_kv_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_mapping: torch.Tensor,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    max_context_len: int,
+    alibi_slopes: torch.Tensor,
+):
+    return output
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -356,38 +443,75 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        past_key_value = getattr(self, "past_key_value", past_key_value)
+        # past_key_value = getattr(self, "past_key_value", past_key_value)
+        past_key_value = past_key_value[self.layer_idx]
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            if isinstance(past_key_value, PagedAttentionCache):
-                # The key/value cache is stored dicretely, so we need to retrieve the entire context
-                # We need an more effcient SDPA kernel to aware this chache
-                key_states, value_states = past_key_value.get_entire_context_states(key_states, value_states)
-
+            past_key_value.reshape_and_cache(past_key_value.slots_mapping_t, key_states, value_states, cache_position)
+            # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # if isinstance(past_key_value, PagedAttentionCache):
+            #     # The key/value cache is stored dicretely, so we need to retrieve the entire context
+            #     # We need an more effcient SDPA kernel to aware this chache
+            #     key_states, value_states = past_key_value.get_entire_context_states(key_states, value_states)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if isinstance(past_key_value, PagedAttentionCache) and not past_key_value.is_prompt :
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+            key_cache = past_key_value.key_cache
+            value_cache = past_key_value.value_cache
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+            query_states = query_states.transpose(1,2).reshape(-1, query_states.size(-3), query_states.size(-1)).contiguous()
+            attn_output = torch.empty_like(query_states)
+            # # breakpoint()
+            
+            attn_output = torch.ops.myops.single_query_cached_kv_attention(attn_output, query_states, key_cache, value_cache, torch.tensor(0), 1/math.sqrt(self.head_dim), past_key_value.block_tables_t, past_key_value.context_lens, past_key_value.block_size, 4096, None)
+            attn_output = attn_output.unsqueeze(1).transpose(1,2).contiguous()
+            # torch.ops.torchao.paged_attention(
+            #     attn_output,
+            #     query_states,
+            #     key_cache,
+            #     value_cache,
+            #     1/math.sqrt(self.head_dim),
+            #     past_key_value.block_tables_t,
+            #     past_key_value.context_lens,
+            #     None,
+            # )
+
+        else:
+            past_key_value.is_prompt = False
+            causal_mask = attention_mask
+            # if attention_mask is not None and cache_position is not None:
+            if attention_mask is not None:
+                causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
             )
+            # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            # if attention_mask is not None:  # no matter the length, we just slice it
+            #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            #     attn_weights = attn_weights + causal_mask
+
+            # # upcast attention to fp32
+            # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            # attn_output = torch.matmul(attn_weights, value_states)
+
+            # if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            #     raise ValueError(
+            #         f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+            #         f" {attn_output.size()}"
+            #     )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -402,7 +526,6 @@ class LlamaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-
         return attn_output, attn_weights, past_key_value
 
 
@@ -662,7 +785,6 @@ class LlamaSdpaAttention(LlamaAttention):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         causal_mask = attention_mask
         # if attention_mask is not None and cache_position is not None:
         if attention_mask is not None:
@@ -847,15 +969,35 @@ class LlamaPreTrainedModel(PreTrainedModel):
                     device=device,
                     dtype=dtype,
                 )
+                layer.self_attn.past_key_value.update_2(1, 2048)
+
+    def _setup_cache_2(self, cache_cls, max_batch_size, generation_config):
+        past_kv_list = []
+        for layer in self.model.layers:
+            device = layer.input_layernorm.weight.device
+            if hasattr(self.config, "_pre_quantization_dtype"):
+                dtype = self.config._pre_quantization_dtype
+            else:
+                dtype = layer.self_attn.o_proj.weight.dtype
+            past_key_value = cache_cls(
+                self.config,
+                max_batch_size*2048//generation_config.block_size,
+                16,#generation_config.block_size,
+                device=device,
+                dtype=dtype,
+            )
+            # past_key_value.update_2(max_batch_size, 2048, num_beams=generation_config.num_beams)
+            past_kv_list.append(past_key_value)
+        return past_kv_list
 
     def _prompt_sharing_with_paged_attention_cache(self, batch_size, beam_size):
-        for layer in self.model.layers:
-            if isinstance(layer.self_attn.past_key_value, PagedAttentionCache):
-                layer.self_attn.past_key_value.set_batch2seq_for_prompt_sharing(batch_size, beam_size)
+        for layer in self.past_kv_list:
+            if isinstance(layer, PagedAttentionCache):
+                layer.set_batch2seq_for_prompt_sharing(batch_size, beam_size)
 
     def _reset_cache(self):
-        for layer in self.model.layers:
-            layer.self_attn.past_key_value = None
+        for layer in self.past_kv_list:
+            layer = None
 
 
 LLAMA_INPUTS_DOCSTRING = r"""
@@ -1001,17 +1143,19 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         past_seen_tokens = 0
-        if use_cache:  # kept for BC (cache positions)
-            if not isinstance(past_key_values, StaticCache) or isinstance(past_key_values, PagedAttentionCache):
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                past_seen_tokens = past_key_values.get_seq_length()
+        # if use_cache:  # kept for BC (cache positions)
+            # if not isinstance(past_key_values, StaticCache) or isinstance(past_key_values, PagedAttentionCache):
+            #     past_key_values = DynamicCache.from_legacy_cache(None)
+            #     past_seen_tokens = past_key_values.get_seq_length()
+                # print(past_seen_tokens)
 
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
                 raise ValueError("cache_position is a required argument when using StaticCache.")
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1] , device=inputs_embeds.device
             )
+        # print((cache_position))
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
@@ -1065,14 +1209,17 @@ class LlamaModel(LlamaPreTrainedModel):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
         next_cache = None
         if use_cache:
-            next_cache = (
-                next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
-            )
+            next_cache = next_decoder_cache
+            # next_cache = (
+            #     next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
+            # )
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        # return hidden_states
+
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1093,12 +1240,12 @@ class LlamaModel(LlamaPreTrainedModel):
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
-        if hasattr(self.layers[0].self_attn, "past_key_value"):  # static cache
-            target_length = self.config.max_position_embeddings
-        else:  # dynamic cache
-            target_length = (
-                attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else cache_position[-1] + 1
-            )
+        # if hasattr(self.layers[0].self_attn, "past_key_value"):  # static cache
+        target_length = self.config.max_position_embeddings
+        # else:  # dynamic cache
+        #     target_length = (
+        #         attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else cache_position[-1] + 1
+        #     )
 
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
@@ -1220,7 +1367,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1260,13 +1406,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-
         return CausalLMOutputWithPast(
-            loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            loss=loss,
         )
 
     def prepare_inputs_for_generation(
@@ -1359,6 +1504,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+
 
 
 @add_start_docstrings(

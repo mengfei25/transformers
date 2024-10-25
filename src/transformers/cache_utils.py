@@ -433,7 +433,57 @@ class StaticCache(Cache):
     def to_legacy_cache(self):
         """Dummy function for BC. We have to keep it because otherwise the call in the forward of models will break it"""
         return None
+import functools
+from typing import List, Optional
+import torch.library
 
+@functools.lru_cache(None)
+def get_meta_lib():
+    return torch.library.Library("myops", "IMPL", "Meta")
+
+
+def register_meta(op_name, overload_name="default"):
+    def wrapper(fn):
+        get_meta_lib().impl(
+            getattr(getattr(torch.ops.myops, op_name), overload_name), fn
+        )
+        return fn
+
+    return wrapper
+# import intel_extension_for_pytorch as ipex
+@torch.library.impl("myops::reshape_and_cache", "CPU")
+def reshape_and_cache(
+    slot_mapping,
+    key_states,
+    value_states,
+    key_cache,
+    value_cache,
+    num_key_value_heads,
+    block_size,
+    cache_position,
+
+):
+    import intel_extension_for_pytorch as ipex
+    ipex.llm.modules.PagedAttention.reshape_and_cache( key_states.transpose(1,2).reshape(-1, key_states.size(-3), key_states.size(-1)),  value_states.transpose(1,2).reshape(-1, value_states.size(-3), value_states.size(-1)), key_cache, value_cache, slot_mapping)
+    return key_cache, value_cache
+
+torch.library.define(
+    "myops::reshape_and_cache",
+    "(Tensor slot_mapping, Tensor key_states, Tensor value_states, Tensor key_cache, Tensor value_cache, int num_key_value_heads, int block_size, Tensor cache_position)"
+    + " -> (Tensor, Tensor)",
+)
+@register_meta("reshape_and_cache")
+def meta_reshape_and_cache(
+    slot_mapping,
+    key_states,
+    value_states,
+    key_cache,
+    value_cache,
+    num_key_value_heads,
+    block_size,
+    cache_position,
+):
+    return key_cache, value_cache
 
 class PagedAttentionCache(Cache):
     def __init__(
@@ -459,14 +509,15 @@ class PagedAttentionCache(Cache):
         )
         cache_shape = (
             self.num_blocks,
-            self.block_size,
             self.num_key_value_heads,
+            self.block_size,
             self.head_dim,
         )
-        self.key_cache: torch.Tensor = torch.zeros(cache_shape, dtype=self.dtype, device=device)
-        self.value_cache: torch.Tensor = torch.zeros(cache_shape, dtype=self.dtype, device=device)
-
-        self.seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.is_prompt = True
+        self.key_cache: torch.Tensor = torch.zeros(cache_shape, dtype=self.dtype)#, device=device)
+        self.value_cache: torch.Tensor = torch.zeros(cache_shape, dtype=self.dtype)#, device=device)
+        self.num_beams = 1
+        self._seen_tokens = 0 #torch.tensor(0, dtype=torch.int)  # Used in `generate` to keep tally of how many tokens the cache has seen
 
         # cache runtime management information
         self.free_blocks = list(range(num_blocks))  # free blocks
@@ -476,7 +527,7 @@ class PagedAttentionCache(Cache):
         # The follow two states are shared accross layer but only for the current decode step. Need to update for every decode step.
         self.batch2seq = {}  # mapping batch index to {seq_id0, seq_id1, ...} to enable prompt sharing.
         self.slots_mapping = []  # mapping logical slots to physical slots.
-
+    # @torch.autograd.profiler.record_function("paged-cache: _copy_on_write")
     def _copy_on_write(self, src_block_idx: int, dst_block_idx: int):
         """
         Copy the content of src_block_idx to dst_block_idx.
@@ -487,7 +538,8 @@ class PagedAttentionCache(Cache):
         """
         self.key_cache[dst_block_idx] = self.key_cache[src_block_idx].clone()
         self.value_cache[dst_block_idx] = self.value_cache[src_block_idx].clone()
-
+    # @torch.autograd.profiler.record_function("paged-cache: _allocate")
+    # @torch.compile
     def _allocate(self, seq_idx: int, key_len: int, past_context_len: int) -> List[int]:
         """
         Allocate physical slots for a given sequence index, key length and context length.
@@ -549,7 +601,7 @@ class PagedAttentionCache(Cache):
             block_offset = token_id % self.block_size
             slots.append(self.block_tables[seq_idx][block_idx] * self.block_size + block_offset)
         return slots
-
+    # @torch.autograd.profiler.record_function("paged-cache: _free")
     def _free(self, seq_idx: int):
         """
         Frees the blocks allocated for the given sequence index.
@@ -568,7 +620,7 @@ class PagedAttentionCache(Cache):
             self.block_ref_count[block_idx] -= 1
             if self.block_ref_count[block_idx] == 0:
                 self.free_blocks.append(block_idx)
-
+    # @torch.autograd.profiler.record_function("paged-cache: _fork")
     def _fork(self, seq_idx: int, new_seq_idx: int):
         """
         Forks the blocks allocated for seq_idx to new_seq_idx.
@@ -586,7 +638,8 @@ class PagedAttentionCache(Cache):
         self.block_tables[new_seq_idx] = self.block_tables[seq_idx]
         for block_idx in self.block_tables[seq_idx]:
             self.block_ref_count[block_idx] += 1
-
+    # @torch.autograd.profiler.record_function("paged-cache: set_batch2seq_for_prompt_sharing")
+    # @torch.compile
     def set_batch2seq_for_prompt_sharing(self, batch_size: int, beam_size: int):
         """
         Set the batch2seq mapping for prompt sharing.
@@ -598,12 +651,15 @@ class PagedAttentionCache(Cache):
         self.batch2seq = {}
         for i in range(batch_size):
             self.batch2seq[i] = [i * beam_size + j for j in range(beam_size)]
-
+        # print(self.batch2seq)
+    # @torch.autograd.profiler.record_function("paged-cache: reshape_and_cache")
+    # @torch.compile
     def reshape_and_cache(
         self,
-        slot_mapping: List[List[int]],
+        slot_mapping: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
+        cache_position: torch.Tensor,
     ):
         """
         Reshapes and caches the key and value states based on the given slot mapping.
@@ -617,21 +673,8 @@ class PagedAttentionCache(Cache):
         Returns:
             None
         """
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.long, device="cpu")
-        block_indicies = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
-        block_indicies = block_indicies.cpu().tolist()
-        block_offsets = slot_mapping % self.block_size
-        block_offsets = block_offsets.cpu().tolist()
-        batch = len(slot_mapping)
-        seq_len = key_states.shape[-2]
-        key = key_states.transpose(1, 2)
-        value = value_states.transpose(1, 2)
-        for bi in range(batch):
-            for ti in range(seq_len):
-                block_idx = block_indicies[bi][ti]
-                block_offset = block_offsets[bi][ti]
-                self.key_cache[block_idx][block_offset] = key[bi][ti]
-                self.value_cache[block_idx][block_offset] = value[bi][ti]
+
+        self.key_cache, self.value_cache = torch.ops.myops.reshape_and_cache(slot_mapping, key_states, value_states, self.key_cache, self.value_cache, self.num_key_value_heads, self.block_size, cache_position)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         RuntimeError("PagedAttentionCache does not have a sequence length.")
@@ -639,7 +682,7 @@ class PagedAttentionCache(Cache):
     def get_max_length(self) -> Optional[int]:
         """Returns the maximum sequence length of the cached states. PagedAttentionCache does not have a maximum length."""
         RuntimeError("PagedAttentionCache does not have a maximum sequence length.")
-
+    # @torch.autograd.profiler.record_function("paged-cache: get_entire_context_states")
     def get_entire_context_states(
         self,
         key_states: torch.Tensor,
@@ -668,12 +711,15 @@ class PagedAttentionCache(Cache):
                 for i in range(seq_len):
                     block_idx = self.block_tables[seq_id][i // self.block_size]
                     block_offset = i % self.block_size
-                    key[batch_idx][i] = self.key_cache[block_idx][block_offset]
-                    value[batch_idx][i] = self.value_cache[block_idx][block_offset]
-            key_states = key.transpose(1, 2).contiguous()
-            value_states = value.transpose(1, 2).contiguous()
-        return key_states, value_states
+                    for head_idx in range(self.num_key_value_heads):
+                        key[batch_idx][i][head_idx] = self.key_cache[block_idx][head_idx][block_offset]
+                        value[batch_idx][i][head_idx] = self.value_cache[block_idx][head_idx][block_offset]
 
+            key_states = key.transpose(1, 2)
+            value_states = value.transpose(1, 2)
+        return key_states, value_states
+    # @torch.autograd.profiler.record_function("paged-cache: update")
+    # @torch.compile
     def update(
         self,
         key_states: torch.Tensor,
@@ -697,8 +743,8 @@ class PagedAttentionCache(Cache):
         """
         batch_size = key_states.shape[0]  # [batch, head, seq, dim]
         cur_len = key_states.shape[-2]
-        past_context_len = self.seen_tokens
-        self.seen_tokens += cur_len
+        past_context_len = self._seen_tokens
+        self._seen_tokens += cur_len
 
         if self.batch2seq == {}:
             self.set_batch2seq_for_prompt_sharing(batch_size, 1)
@@ -724,8 +770,121 @@ class PagedAttentionCache(Cache):
         # step 4): setup batch2seq for next decode step
         self.batch2seq = {i: [i] for i in range(len(self.block_tables))}
 
-        return key_states, value_states
 
+        return key_states, value_states
+    @torch.autograd.profiler.record_function("paged-cache: update_3")
+    def update_3(
+        self,
+        batch_size: int,
+        cur_len: int,
+        num_beams: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update the cache with key and value states for a specific layer.
+
+        Args:
+            key_states (torch.Tensor): The key states tensor of shape [batch, head, seq, dim].
+            value_states (torch.Tensor): The value states tensor of shape [batch, head, seq, dim].
+            layer_idx (int): The index of the layer.
+            cache_kwargs (Dict[str, Any]): Additional arguments for the cache subclass.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the updated key states and value states tensors.
+
+        Raises:
+            AssertionError: If the batch size is inconsistent with the existing cache.
+        """
+        past_context_len = self._seen_tokens
+        self._seen_tokens += cur_len
+
+        if self.batch2seq == {}:
+            self.set_batch2seq_for_prompt_sharing(batch_size, 1)
+
+        # step 1): allocate slots to store token states for each sequence in the batch.
+        self.slots_mapping = []
+        for batch_idx in range(batch_size):
+            # only allocate the slots for the first sequence in the batch to enable prompt sharing
+            seq_id = self.batch2seq[batch_idx][0]
+            # print(seq_id)
+            slots = self._allocate(seq_id, cur_len, past_context_len)
+            # print(slots)
+            self.slots_mapping.append(slots)
+        # print("===============")
+        # step 2): cache key_states & value_states
+
+        # step 3): fork new sequences to enable prompt sharing
+        for batch_idx in range(batch_size):
+            seq_ids = self.batch2seq[batch_idx]
+            # fork the blocks allocated for the first sequence to other sequences in the batch
+            for seq_id in seq_ids[1:]:
+                self._fork(seq_ids[0], seq_id)
+
+        # step 4): setup batch2seq for next decode step
+        self.batch2seq = {i: [i] for i in range(len(self.block_tables))}
+        # print(self.batch2seq)
+
+    def update_2(
+        self,
+        batch_size: int,
+        cur_len: int,
+        num_beams: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Update the cache with key and value states for a specific layer.
+
+        Args:
+            key_states (torch.Tensor): The key states tensor of shape [batch, head, seq, dim].
+            value_states (torch.Tensor): The value states tensor of shape [batch, head, seq, dim].
+            layer_idx (int): The index of the layer.
+            cache_kwargs (Dict[str, Any]): Additional arguments for the cache subclass.
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the updated key states and value states tensors.
+
+        Raises:
+            AssertionError: If the batch size is inconsistent with the existing cache.
+        """
+        # batch_size = key_states.shape[0]  # [batch, head, seq, dim]
+        # cur_len = key_states.shape[-2]
+        # print(self._seen_tokens)
+        # print(cur_len)
+        past_context_len = self._seen_tokens
+        # self._seen_tokens += cur_len
+
+        if self.batch2seq == {}:
+            # breakpoint()
+            self.set_batch2seq_for_prompt_sharing(batch_size, num_beams)
+        # step 1): allocate slots to store token states for each sequence in the batch.
+        self.slots_mapping = []
+        for batch_idx in range(batch_size):
+            # only allocate the slots for the first sequence in the batch to enable prompt sharing
+            seq_id = self.batch2seq[batch_idx][0]
+            # print(seq_id)
+            # breakpoint()
+            slots = self._allocate(seq_id, cur_len, past_context_len)
+            # print(slots)
+            self.slots_mapping.append(slots)
+        # print("===============")
+        # step 2): cache key_states & value_states
+        # self.reshape_and_cache(self.slots_mapping, key_states, value_states)
+
+        # step 3): fork new sequences to enable prompt sharing
+        for batch_idx in range(batch_size):
+            seq_ids = self.batch2seq[batch_idx]
+            # fork the blocks allocated for the first sequence to other sequences in the batch
+            for seq_id in seq_ids[1:]:
+                self._fork(seq_ids[0], seq_id)
+
+        # step 4): setup batch2seq for next decode step
+        self.batch2seq = {i: [i] for i in range(len(self.block_tables))}
+        # print(self.batch2seq)
+
+        # return key_states, value_states
+
+    def to_legacy_cache(self):
+        """Dummy function for BC. We have to keep it because otherwise the call in the forward of models will break it"""
+        return None
+    # @torch.autograd.profiler.record_function("paged-cache: reorder_cache")
+    # @torch.compile
+    @torch.autograd.profiler.record_function("paged-cache: reorder_cache")
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
         """
         Reorder the cache according to the beam index. The beam index is a tensor of shape (batch_size,)
@@ -744,7 +903,3 @@ class PagedAttentionCache(Cache):
         for seq_idx in freed_seqs:
             self._free(seq_idx)
         self.block_tables = new_block_tables
-
-    def to_legacy_cache(self):
-        """Dummy function for BC. We have to keep it because otherwise the call in the forward of models will break it"""
-        return None

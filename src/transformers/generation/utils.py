@@ -653,6 +653,7 @@ class GenerationMixin:
         standardize_cache_format: bool = False,
     ) -> Dict[str, Any]:
         # update past_key_values
+        # breakpoint()
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
             outputs, standardize_cache_format=standardize_cache_format
         )
@@ -682,6 +683,7 @@ class GenerationMixin:
 
         if "cache_position" in model_kwargs and model_kwargs["cache_position"] is not None:
             model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + 1
+
 
         return model_kwargs
 
@@ -1463,7 +1465,8 @@ class GenerationMixin:
                     "The `generation_config` defines a `cache_implementation` that is not compatible with this model."
                     " Make sure it has a `_setup_cache` function."
                 )
-            self._setup_cache(cache_cls, max_batch_size=batch_size, generation_config=generation_config)
+            # breakpoint()
+            self.past_kv_list = self._setup_cache_2(cache_cls, max_batch_size=batch_size, generation_config=generation_config)
 
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
@@ -2434,6 +2437,12 @@ class GenerationMixin:
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if hasattr(self, "past_kv_list"):
+                model_inputs["past_key_values"] = self.past_kv_list
+                cache_position = model_inputs["cache_position"]
+                for past_kv in self.past_kv_list:
+                    past_kv.update_3(model_inputs["input_ids"].size(0), model_inputs["input_ids"].size(1), 1)
+                    past_kv.context_lens = torch.tensor([cache_position[-1]  + 1 for _ in range(model_inputs["input_ids"].size(0))], dtype=torch.int)
 
             # forward pass to get next token
             outputs = self(
@@ -2484,6 +2493,7 @@ class GenerationMixin:
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
+            # outputs.past_key_values = None
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
@@ -3054,7 +3064,22 @@ class GenerationMixin:
         is_prompt = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
+            if hasattr(self, "past_kv_list"):
+                model_inputs["past_key_values"] = self.past_kv_list
+                cache_position = model_inputs["cache_position"]
+                for past_kv in self.past_kv_list:
+                    # print(model_inputs["input_ids"].size(0))
+                    past_kv.update_3(model_inputs["input_ids"].size(0), model_inputs["input_ids"].size(1), num_beams)
+                    past_kv.context_lens = torch.tensor([cache_position[-1]  + 1 for _ in range(model_inputs["input_ids"].size(0))], dtype=torch.int)
+                    past_kv.slots_mapping_t = torch.tensor(past_kv.slots_mapping)
+                    past_kv.num_beams = num_beams
+                    block_tables_t = []
+                    for seq_idx in range(model_inputs["input_ids"].size(0)):
+                        block_tables_t.append(past_kv.block_tables[seq_idx])
+                    past_kv.block_tables_t = torch.tensor(
+                        block_tables_t, dtype=torch.int32
+                    )
+                    # print(past_kv.block_tables_t.shape)
             # if sequential is True, split the input to batches of batch_size and run sequentially
             if sequential:
                 if any(
@@ -3091,12 +3116,25 @@ class GenerationMixin:
                 outputs = stack_model_outputs(outputs_per_sub_batch)
 
             else:  # Unchanged original behavior
-                outputs = self(
-                    **model_inputs,
-                    return_dict=True,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                )
+                # def trace_handler(prof):
+                #     print(prof.key_averages().table(
+                #         sort_by="self_cpu_time_total", row_limit=-1))
+                # with torch.profiler.profile(
+                #         activities=[
+                #             torch.profiler.ProfilerActivity.CPU],
+                #         schedule=torch.profiler.schedule(
+                #             wait=0,
+                #             warmup=0,
+                #             active=1),
+                #         on_trace_ready=trace_handler
+                #         ) as prof:
+                    outputs = self(
+                        **model_inputs,
+                        return_dict=True,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                    )
+                    # prof.step()
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
@@ -3111,7 +3149,7 @@ class GenerationMixin:
                     **model_kwargs,
                 )
                 outputs = self._expand_outputs_for_generation(expand_size=num_beams, outputs=outputs)
-
+            
             next_token_logits = outputs.logits[:, -1, :]
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
@@ -3171,22 +3209,20 @@ class GenerationMixin:
             beam_idx = beam_outputs["next_beam_indices"]
 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
-
+            # outputs.past_key_values=None
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
-            if model_kwargs.get("past_key_values", None) is not None:
+            # outputs.past_key_values=None
+            if False and model_kwargs.get("past_key_values", None) is not None:
                 model_kwargs["past_key_values"] = self._temporary_reorder_cache(
                     model_kwargs["past_key_values"], beam_idx
                 )
             elif self.generation_config.cache_implementation == "paged":
-                for _, sub_mod in self.named_modules():
-                    past_key_value = getattr(sub_mod, "past_key_value", None)
-                    if isinstance(past_key_value, PagedAttentionCache):
-                        self._temporary_reorder_cache(past_key_value, beam_idx)
-
+                for pask_kv in self.past_kv_list:
+                    pask_kv.reorder_cache(beam_idx)
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
 
