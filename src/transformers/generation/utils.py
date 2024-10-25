@@ -3079,6 +3079,9 @@ class GenerationMixin:
                     past_kv.block_tables_t = torch.tensor(
                         block_tables_t, dtype=torch.int32
                     )
+                if self.past_kv_list[0].is_prompt == False:
+                    # model_inputs["past_key_values"]
+                    model_inputs.pop("attention_mask", None)
                     # print(past_kv.block_tables_t.shape)
             # if sequential is True, split the input to batches of batch_size and run sequentially
             if sequential:
