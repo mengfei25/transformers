@@ -19,6 +19,7 @@ import inspect
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+import time
 
 import torch
 import torch.distributed as dist
@@ -1343,6 +1344,7 @@ class GenerationMixin:
         self._validate_model_class()
         generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
         self._validate_model_kwargs(model_kwargs.copy())
+        self.token_latency = self.config.token_latency if hasattr(self.config, "token_latency") else None
 
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
@@ -2433,9 +2435,11 @@ class GenerationMixin:
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
+        latency_list = []
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
+            tic = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if hasattr(self, "past_kv_list"):
                 model_inputs["past_key_values"] = self.past_kv_list
@@ -2508,13 +2512,14 @@ class GenerationMixin:
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
+            latency_list.append(time.time() - tic)
 
         if streamer is not None:
             streamer.end()
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
-                return GenerateEncoderDecoderOutput(
+                output_result = GenerateEncoderDecoderOutput(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
@@ -2526,7 +2531,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateDecoderOnlyOutput(
+                output_result = GenerateDecoderOnlyOutput(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
@@ -2535,7 +2540,11 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            output_result = input_ids
+        if self.token_latency is not None:
+            return (output_result, latency_list)
+        else:
+            return output_result
 
     def sample(self, *args, **kwargs):
         logger.warning_once(
@@ -2726,9 +2735,11 @@ class GenerationMixin:
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
+        latency_list = []
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
+            tic = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             # forward pass to get next token
@@ -2787,6 +2798,7 @@ class GenerationMixin:
                 model_kwargs,
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
+            latency_list.append(time.time() - tic)
 
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id_tensor is not None:
@@ -2802,7 +2814,7 @@ class GenerationMixin:
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
-                return GenerateEncoderDecoderOutput(
+                output_result = GenerateEncoderDecoderOutput(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
@@ -2814,7 +2826,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateDecoderOnlyOutput(
+                output_result = GenerateDecoderOnlyOutput(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
@@ -2823,7 +2835,11 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            output_result = input_ids
+        if self.token_latency is not None:
+            return (output_result, latency_list)
+        else:
+            return output_result
 
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
         """
@@ -3059,10 +3075,12 @@ class GenerationMixin:
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
         this_peer_finished = False
+        latency_list = []
 
         decoder_prompt_len = input_ids.shape[-1]  # record the prompt length of decoder
         is_prompt = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            tic = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if hasattr(self, "past_kv_list"):
                 model_inputs["past_key_values"] = self.past_kv_list
@@ -3230,6 +3248,7 @@ class GenerationMixin:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
 
             # increase cur_len
+            latency_list.append(time.time() - tic)
             cur_len = cur_len + 1
             is_prompt = False
             if beam_scorer.is_done or all(stopping_criteria(input_ids, scores)):
@@ -3252,7 +3271,7 @@ class GenerationMixin:
                 sequence_outputs["sequence_scores"] = None
 
             if self.config.is_encoder_decoder:
-                return GenerateBeamEncoderDecoderOutput(
+                output_result = GenerateBeamEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
@@ -3266,7 +3285,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateBeamDecoderOnlyOutput(
+                output_result = GenerateBeamDecoderOnlyOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
@@ -3277,7 +3296,11 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return sequence_outputs["sequences"]
+            output_result = sequence_outputs["sequences"]
+        if self.token_latency is not None:
+            return (output_result, latency_list)
+        else:
+            return output_result
 
     def beam_sample(self, *args, **kwargs):
         logger.warning_once(
@@ -3484,10 +3507,12 @@ class GenerationMixin:
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
         this_peer_finished = False
+        latency_list = []
 
         decoder_prompt_len = input_ids.shape[-1]  # record the prompt length of decoder
         is_prompt = True
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            tic = time.time()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
             outputs = self(
@@ -3596,6 +3621,7 @@ class GenerationMixin:
 
             # increase cur_len
             cur_len = cur_len + 1
+            latency_list.append(time.time() - tic)
 
             is_prompt = False
             if beam_scorer.is_done or all(stopping_criteria(input_ids, scores)):
@@ -3618,7 +3644,7 @@ class GenerationMixin:
                 sequence_outputs["sequence_scores"] = None
 
             if self.config.is_encoder_decoder:
-                return GenerateBeamEncoderDecoderOutput(
+                output_result = GenerateBeamEncoderDecoderOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
@@ -3632,7 +3658,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateBeamDecoderOnlyOutput(
+                output_result = GenerateBeamDecoderOnlyOutput(
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
@@ -3643,7 +3669,11 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return sequence_outputs["sequences"]
+            output_result = sequence_outputs["sequences"]
+        if self.token_latency is not None:
+            return (output_result, latency_list)
+        else:
+            return output_result
 
     def group_beam_search(self, *args, **kwargs):
         logger.warning_once(
