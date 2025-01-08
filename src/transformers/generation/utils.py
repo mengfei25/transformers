@@ -2923,78 +2923,95 @@ class GenerationMixin:
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
         latency_list = []
 
-        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-            # prepare model inputs
-            tic = time.time()
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        from torch._inductor import config as inductor_config
+        inductor_config.profiler_mark_wrapper_call = True
+        inductor_config.cpp.enable_kernel_profile = True
+        def trace_handler(prof):
+            print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))
 
-            # prepare variable output controls (note: some models won't accept all output controls)
-            model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
-            model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
+        if True:
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU],
+                schedule=torch.profiler.schedule(
+                    wait=10,
+                    warmup=3,
+                    active=1),
+                on_trace_ready=trace_handler
+                ) as prof:
+                    while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+                        # prepare model inputs
+                        tic = time.time()
+                        model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            # forward pass to get next token
-            outputs = self(**model_inputs, return_dict=True)
+                        # prepare variable output controls (note: some models won't accept all output controls)
+                        model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
+                        model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
 
-            if synced_gpus and this_peer_finished:
-                continue  # don't waste resources running the code we don't need
+                        # forward pass to get next token
+                        outputs = self(**model_inputs, return_dict=True)
 
-            # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
-            # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone()
+                        if synced_gpus and this_peer_finished:
+                            continue  # don't waste resources running the code we don't need
 
-            # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
-            if do_sample:
-                next_token_scores = logits_warper(input_ids, next_token_scores)
+                        # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
+                        # (the clone itself is always small)
+                        next_token_logits = outputs.logits[:, -1, :].clone()
 
-            # Store scores, attentions and hidden_states when required
-            if return_dict_in_generate:
-                if output_scores:
-                    scores += (next_token_scores,)
-                if output_logits:
-                    raw_logits += (next_token_logits,)
-                if output_attentions:
-                    decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
-                    )
-                    if self.config.is_encoder_decoder:
-                        cross_attentions += (outputs.cross_attentions,)
+                        # pre-process distribution
+                        next_token_scores = logits_processor(input_ids, next_token_logits)
+                        if do_sample:
+                            next_token_scores = logits_warper(input_ids, next_token_scores)
 
-                if output_hidden_states:
-                    decoder_hidden_states += (
-                        (outputs.decoder_hidden_states,)
-                        if self.config.is_encoder_decoder
-                        else (outputs.hidden_states,)
-                    )
+                        # Store scores, attentions and hidden_states when required
+                        if return_dict_in_generate:
+                            if output_scores:
+                                scores += (next_token_scores,)
+                            if output_logits:
+                                raw_logits += (next_token_logits,)
+                            if output_attentions:
+                                decoder_attentions += (
+                                    (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                                )
+                                if self.config.is_encoder_decoder:
+                                    cross_attentions += (outputs.cross_attentions,)
 
-            # token selection
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+                            if output_hidden_states:
+                                decoder_hidden_states += (
+                                    (outputs.decoder_hidden_states,)
+                                    if self.config.is_encoder_decoder
+                                    else (outputs.hidden_states,)
+                                )
 
-            # finished sentences should have their next token be a padding token
-            if has_eos_stopping_criteria:
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                        # token selection
+                        if do_sample:
+                            probs = nn.functional.softmax(next_token_scores, dim=-1)
+                            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                        else:
+                            next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-            # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            if streamer is not None:
-                streamer.put(next_tokens.cpu())
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-            )
+                        # finished sentences should have their next token be a padding token
+                        if has_eos_stopping_criteria:
+                            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
-            this_peer_finished = unfinished_sequences.max() == 0
+                        # update generated ids, model inputs, and length for next step
+                        input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                        if streamer is not None:
+                            streamer.put(next_tokens.cpu())
+                        model_kwargs = self._update_model_kwargs_for_generation(
+                            outputs,
+                            model_kwargs,
+                            is_encoder_decoder=self.config.is_encoder_decoder,
+                        )
 
-            # This is needed to properly delete outputs.logits which may be very large for first iteration
-            # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
-            latency_list.append(time.time() - tic)
-            del outputs
+                        unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
+                        this_peer_finished = unfinished_sequences.max() == 0
+
+                        # This is needed to properly delete outputs.logits which may be very large for first iteration
+                        # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
+                        latency_list.append(time.time() - tic)
+                        del outputs
+                        prof.step()
 
         if streamer is not None:
             streamer.end()
